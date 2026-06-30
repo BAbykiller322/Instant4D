@@ -5,7 +5,8 @@ import point_cloud_utils as pcu
 import json
 from typing import NamedTuple
 import os
-import glob 
+import glob
+import argparse
 class pcd (NamedTuple):
     xyz: np.ndarray
     rgb: np.ndarray
@@ -144,40 +145,36 @@ def dynamic_static_split(pc, threshold=0.7):
     
     return dynamic_pcd, static_pcd
 
-def make_transforms(intrinsic, cam_c2w, save_dir, scene ,W):
+def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
     scale_factor = 480/W
     B = cam_c2w.shape[0]
     print(f"cam_c2w: {cam_c2w.shape}")
 
     dict_to_save = {}
-    # dict_to_save["w"]    = 854
-    # dict_to_save["h"]    = 480
-    dict_to_save["w"]    = 480
-    dict_to_save["h"]    = 720
-    
+    dict_to_save["w"]    = int(W * scale_factor)
+    dict_to_save["h"]    = int(H * scale_factor)
+
     dict_to_save["fl_x"] = (intrinsic[0, 0] * scale_factor).item()
     dict_to_save["fl_y"] = (intrinsic[1, 1] * scale_factor).item()
     dict_to_save["cx"]   = (intrinsic[0, 2] * scale_factor).item()
     dict_to_save["cy"]   = (intrinsic[1, 2] * scale_factor).item()
     frame = []
 
-    dycheck_path = "/data/zhanpeng/sora"
-    
-    selected =   range(B) 
+    selected =   range(B)
     remaining =  selected
 
     print(f"selected_len: {len(selected)}")
     print(f"remaining_len: {len(remaining)}")
-    
+
     train_frame = []
     for i in selected:
         frame_dict = {
-            "file_path": f"{dycheck_path}/{scene}/{i+1:05d}",
+            "file_path": f"{scene}/{i:05d}",
             "transform_matrix": cam_c2w[i].tolist(),
             "time": i/(B-1)*3
         }
         train_frame.append(frame_dict)
-    
+
     dict_to_save["frames"] = train_frame
 
     with open(f"{save_dir}/transforms_train.json", "w") as f:
@@ -187,14 +184,14 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene ,W):
     test_frame = []
     for i in remaining:
         frame_dict = {
-            "file_path": f"{dycheck_path}/{scene}/{i+1:05d}",
+            "file_path": f"{scene}/{i:05d}",
             "transform_matrix": cam_c2w[i].tolist(),
             "time": i/(B-1)*3
         }
         test_frame.append(frame_dict)
-    
+
     dict_to_save["frames"] = test_frame
-    
+
     with open(f"{save_dir}/transforms_test.json", "w") as f:
         json.dump(dict_to_save, f, indent=4)
     
@@ -204,7 +201,7 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False):
         
     B, H, W = depth.shape
     print(f"depth shape: {depth.shape}")
-    make_transforms(intrinsic, cam_c2w, save_dir, scene, W)
+    make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W)
     
     # select every 10th frame 
     # n H W 
@@ -280,18 +277,16 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False):
             cam_c2w=cam_c2w)
 
 if __name__ == "__main__":
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--droid_path", required=True,
+                        help="path to <scene>_sgd_cvd_hr.npz")
+    parser.add_argument("--motion_path", required=True,
+                        help="path to motion_prob.npy")
+    parser.add_argument("--save_dir", required=True,
+                        help="output directory for filtered_cvd.npz and transforms")
+    parser.add_argument("--scene_name", required=True)
+    args = parser.parse_args()
 
-    scene_list = [ "pizza","einstein"]
-
-    droid_dir = "Instant4D/SLAM/mega-sam/outputs_cvd"
-    motion_dir_msam = "Instant4D/SLAM/mega-sam/reconstructions"
-    save_dir = "Instant4D/SLAM/voxel_filter/output/sora"
-    
-    
-    for scene in scene_list:
-        droid_path = f"{droid_dir}/{scene}_sgd_cvd_hr.npz"
-        motion_path = f"{motion_dir_msam}/{scene}/motion_prob.npy"
-        save_path = f"{save_dir}/{scene}"
-        os.makedirs(save_path, exist_ok=True)
-        voxel_filter(droid_path, motion_path, save_path, scene, use_mask=False)
+    os.makedirs(args.save_dir, exist_ok=True)
+    voxel_filter(args.droid_path, args.motion_path, args.save_dir,
+                 args.scene_name, use_mask=False)
