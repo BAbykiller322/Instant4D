@@ -39,3 +39,19 @@ eggs/
 *.egg
 
 fourth_party/DynamicNeRF
+
+# Local build caches and generated Python package metadata
+.torch_extensions/
+**/*.egg-info/
+
+# Downloaded checkpoints and model archives
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+SLAM/mega-sam/cvd_opt/models.zip
+
+# Per-scene preprocessing outputs; datasets live outside this repo, but keep
+# accidental copied outputs out of version control if a scene is staged here.
+preprocess_output/
+**/preprocess_output/
