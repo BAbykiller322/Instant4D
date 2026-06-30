@@ -1,17 +1,35 @@
 import numpy as np
-import open3d as o3d
 import cv2
-import point_cloud_utils as pcu
 import json
 from typing import NamedTuple
 import os
-import glob
 import argparse
 class pcd (NamedTuple):
     xyz: np.ndarray
     rgb: np.ndarray
     prob_motion: np.ndarray
     time_stamp: np.ndarray
+
+def downsample_point_cloud_on_voxel_grid(voxel_size, xyz, *features):
+    """Numpy replacement for point_cloud_utils voxel-grid downsampling."""
+    if xyz.shape[0] == 0:
+        return (xyz, *features)
+    if voxel_size <= 0:
+        raise ValueError(f"voxel_size must be positive, got {voxel_size}")
+
+    keys = np.floor(xyz / voxel_size).astype(np.int64)
+    _, inverse, counts = np.unique(
+        keys, axis=0, return_inverse=True, return_counts=True)
+
+    def voxel_mean(values):
+        values = np.asarray(values)
+        out = np.zeros((counts.shape[0],) + values.shape[1:],
+                       dtype=np.float64)
+        np.add.at(out, inverse, values)
+        out /= counts.reshape((-1,) + (1,) * (values.ndim - 1))
+        return out.astype(values.dtype, copy=False)
+
+    return (voxel_mean(xyz), *(voxel_mean(feature) for feature in features))
 
 def back_project(depth, intrinsic, cam_c2w):
     """
@@ -100,7 +118,7 @@ def read_droid_data(droid_path, motion_path, save_dir):
     
     
 
-    return depth, color, resized_motion.reshape(-1, 1), intrinsic, cam_c2w
+    return depth, color, resized_motion, intrinsic, cam_c2w
 
 def process_data(depth, color, motion_prob, intrinsic, cam_c2w):
     B, H, W = depth.shape
@@ -123,7 +141,7 @@ def process_data(depth, color, motion_prob, intrinsic, cam_c2w):
 
 def dynamic_static_split(pc, threshold=0.7):
     # this is a simpler version just use the threshold 0.5
-    dynamic_region = pc.prob_motion > 0.5
+    dynamic_region = (pc.prob_motion > 0.5).reshape(-1)
     static_region = ~dynamic_region
     
     print(f"shape of dynamic region: {dynamic_region.shape}")
@@ -167,11 +185,12 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
     print(f"remaining_len: {len(remaining)}")
 
     train_frame = []
+    time_den = max(B - 1, 1)
     for i in selected:
         frame_dict = {
             "file_path": f"{scene}/{i:05d}",
             "transform_matrix": cam_c2w[i].tolist(),
-            "time": i/(B-1)*3
+            "time": i/time_den*3
         }
         train_frame.append(frame_dict)
 
@@ -186,7 +205,7 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
         frame_dict = {
             "file_path": f"{scene}/{i:05d}",
             "transform_matrix": cam_c2w[i].tolist(),
-            "time": i/(B-1)*3
+            "time": i/time_den*3
         }
         test_frame.append(frame_dict)
 
@@ -194,24 +213,49 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
 
     with open(f"{save_dir}/transforms_test.json", "w") as f:
         json.dump(dict_to_save, f, indent=4)
-    
+def export_source_images(color, save_dir, scene, H, W, image_output_dir=None):
+    scale_factor = 480 / W
+    out_w = int(W * scale_factor)
+    out_h = int(H * scale_factor)
+    image_dir = image_output_dir or os.path.join(save_dir, scene)
+    os.makedirs(image_dir, exist_ok=True)
 
-def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False):    
+    for i in range(color.shape[0]):
+        color_resized = cv2.resize(color[i], (out_w, out_h),
+                                   interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(image_dir, f"{i:05d}.png"),
+                    color_resized[:, :, ::-1])
+
+    scene_link = os.path.join(save_dir, scene)
+    if image_output_dir is None:
+        return
+    if os.path.islink(scene_link):
+        os.unlink(scene_link)
+    if os.path.exists(scene_link):
+        if os.path.abspath(scene_link) != os.path.abspath(image_dir):
+            raise FileExistsError(
+                f"{scene_link} exists and is not the requested image link")
+        return
+    os.symlink(os.path.relpath(image_dir, save_dir), scene_link,
+               target_is_directory=True)
+
+def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
+                 prune_stride=3, image_output_dir=None):
     depth, color, motion_prob, intrinsic, cam_c2w = read_droid_data(droid_path, motion_path, save_dir)
         
     B, H, W = depth.shape
     print(f"depth shape: {depth.shape}")
     make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W)
+    export_source_images(color, save_dir, scene, H, W, image_output_dir)
     
     # select every 10th frame 
     # n H W 
-    color = color[::3]
-    depth = depth[::3]
-    cam_c2w = cam_c2w[::3]
-    motion_prob = motion_prob[::3]
+    color = color[::prune_stride]
+    depth = depth[::prune_stride]
+    cam_c2w = cam_c2w[::prune_stride]
+    motion_prob = motion_prob[::prune_stride]
     
-    motion_prob = np.concatenate(motion_prob, axis=0)
-    motion_prob = motion_prob.astype(np.float32)
+    motion_prob = motion_prob.reshape(-1, 1).astype(np.float32)
     
     print(f"motion_prob shape: {motion_prob.shape}")
     print(f"color shape: {color.shape}")
@@ -230,23 +274,20 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False):
     voxel_size_dynamic = mean_depth / focal * 0.5
     voxel_size_static  = mean_depth / focal * 2
     
-    xyz_static, rgb_static, prob_motion_static= pcu.downsample_point_cloud_on_voxel_grid(voxel_size_static,
-                                                                                         pcd_static.xyz,
-                                                                                         pcd_static.rgb,
-                                                                                         pcd_static.prob_motion)
+    xyz_static, rgb_static, prob_motion_static = downsample_point_cloud_on_voxel_grid(
+        voxel_size_static, pcd_static.xyz, pcd_static.rgb, pcd_static.prob_motion)
     
-    xyz_dynamic, rgb_dynamic, prob_motion_dynamic, time_stamp_dynamic = pcu.downsample_point_cloud_on_voxel_grid(voxel_size_dynamic,
-                                                                                         pcd_dynamic.xyz,
-                                                                                         pcd_dynamic.rgb,
-                                                                                         pcd_dynamic.prob_motion,
-                                                                                         pcd_dynamic.time_stamp)
+    xyz_dynamic, rgb_dynamic, prob_motion_dynamic, time_stamp_dynamic = downsample_point_cloud_on_voxel_grid(
+        voxel_size_dynamic, pcd_dynamic.xyz, pcd_dynamic.rgb,
+        pcd_dynamic.prob_motion, pcd_dynamic.time_stamp)
     
     
 
     
     time_stamp_static = np.repeat(1, xyz_static.shape[0])
     scale_time_static = np.repeat(3, xyz_static.shape[0])
-    scale_time_dynamic = np.repeat(3/((B-1)*10), xyz_dynamic.shape[0])
+    time_den = max(B - 1, 1)
+    scale_time_dynamic = np.repeat(3/(time_den*10), xyz_dynamic.shape[0])
 
     xyz_sampled = np.concatenate([xyz_static, xyz_dynamic], axis=0)
     rgb_sampled = np.concatenate([rgb_static, rgb_dynamic], axis=0)
@@ -285,8 +326,14 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", required=True,
                         help="output directory for filtered_cvd.npz and transforms")
     parser.add_argument("--scene_name", required=True)
+    parser.add_argument("--prune_stride", "--stride", type=int, default=3,
+                        help="frame stride for point-cloud initialization")
+    parser.add_argument("--image_output_dir", default=None,
+                        help="optional real image export dir; save_dir/scene_name becomes a symlink")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     voxel_filter(args.droid_path, args.motion_path, args.save_dir,
-                 args.scene_name, use_mask=False)
+                 args.scene_name, use_mask=False,
+                 prune_stride=args.prune_stride,
+                 image_output_dir=args.image_output_dir)
