@@ -6,11 +6,12 @@ rot_4d: True
 force_sh_3d: False
 batch_size: 1
 exhaust_test: True
+save_iterations: [3000, 5000]
 
 ModelParams:
   sh_degree: 0
-  source_path: ""
-  model_path: ""
+  source_path: "/projects/b5dg/Dycheck-iphone/teddy/preprocess_output/instant4d_source"
+  model_path: "/scratch/b5dg/buttonxi.b5dg/instant4d_outputs/teddy"
   images: "images"
   resolution: 1
   white_background: False

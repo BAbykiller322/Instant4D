@@ -6,6 +6,7 @@ rot_4d: True
 force_sh_3d: False
 batch_size: 1
 exhaust_test: True
+save_iterations: [3000, 5000]
 
 ModelParams:
   sh_degree: 0
