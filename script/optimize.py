@@ -252,10 +252,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
-
-                    saving_path = os.path.join(scene.model_path, f"iter_{iteration}")                    
-                    scene.render_evaluate_dycheck(saving_path, gaussians, pipe, background)
-                    # scene.render_train(saving_path, gaussians, pipe, background)
+                    scene.save(iteration)
                     
                     
                 # Densification, We can always turn on the densification for better performance
