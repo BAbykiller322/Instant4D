@@ -349,7 +349,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument("--config", default = "",type=str)
+    parser.add_argument("--config", default="", type=str)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000])
@@ -368,16 +368,9 @@ if __name__ == "__main__":
     parser.add_argument("--exhaust_test", action="store_true")
     network_gui_websocket.init("127.0.0.1", 6119) # make sure to forward this port on the code IDE
     args = parser.parse_args(sys.argv[1:])
-    # cfg_dir, specfiy training parameter for optimization
-    cfg_path    = "Instant4D/configs/sora/panda.yaml"
-    # source_dir, specify the pruning results from geometry recovery
-    source_path = "Instant4D/example/panda" 
-    # model_dir, the place we save visualization
-    model_path  = "Instant4D/example/panda"
-
-
-
-    args.config = cfg_path
+    if not args.config:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        args.config = os.path.join(repo_root, "configs", "dycheck", "apple.yaml")
     cfg = OmegaConf.load(args.config)
     
     # a nasty fix for a bug during development
@@ -403,8 +396,6 @@ if __name__ == "__main__":
     lp_ = lp.extract(args)
     op_ = op.extract(args)
     pp_ = pp.extract(args)
-    lp_.source_path = source_path
-    lp_.model_path  = model_path
 
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)

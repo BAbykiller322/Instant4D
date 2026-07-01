@@ -9,8 +9,8 @@ exhaust_test: True
 
 ModelParams:
   sh_degree: 0
-  source_path: ""
-  model_path: ""
+  source_path: "/projects/b5dg/Dycheck-iphone/apple/preprocess_output/instant4d_source"
+  model_path: "/scratch/b5dg/buttonxi.b5dg/instant4d_outputs/apple"
   images: "images"
   resolution: 1
   white_background: False
