@@ -30,7 +30,7 @@ class Scene:
     gaussians : GaussianModel
     evaluation_metrics = {}
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], num_pts=100_000, num_pts_ratio=1.0, time_duration=None):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], num_pts=100_000, num_pts_ratio=1.0, time_duration=None, initialize_gaussians=True):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -95,16 +95,17 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
             
-        if args.loaded_pth:
-            self.gaussians.create_from_pth(args.loaded_pth, self.cameras_extent)
-        else:
-            if self.loaded_iter:
-                self.gaussians.load_ply(os.path.join(self.model_path,
-                                                            "point_cloud",
-                                                            "iteration_" + str(self.loaded_iter),
-                                                            "point_cloud.ply"))
+        if initialize_gaussians:
+            if args.loaded_pth:
+                self.gaussians.create_from_pth(args.loaded_pth, self.cameras_extent)
             else:
-                self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+                if self.loaded_iter:
+                    self.gaussians.load_ply(os.path.join(self.model_path,
+                                                                "point_cloud",
+                                                                "iteration_" + str(self.loaded_iter),
+                                                                "point_cloud.ply"))
+                else:
+                    self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
     def save(self, iteration):
         torch.save((self.gaussians.capture(), iteration), self.model_path + "/chkpnt" + str(iteration) + ".pth")
