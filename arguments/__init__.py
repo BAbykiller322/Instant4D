@@ -104,6 +104,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_opa_mask = 0.0
         self.lambda_rigid = 0.0
         self.lambda_motion = 0.0
+        self.lambda_traj = 0.0
+        self.traj_assoc = ""
+        self.traj_anchors = ""
+        self.traj_tracks = ""
+        self.traj_batch = 1024
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

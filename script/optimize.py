@@ -41,8 +41,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.training_setup(opt)
     
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+
+    traj_loss_fn = None
+    if opt.lambda_traj > 0:
+        if not (opt.traj_assoc and opt.traj_anchors and opt.traj_tracks):
+            raise ValueError("lambda_traj requires --traj_assoc, --traj_anchors, and --traj_tracks")
+        from utils.traj_loss import TrajLoss
+        traj_loss_fn = TrajLoss(
+            assoc_path=opt.traj_assoc,
+            anchors_path=opt.traj_anchors,
+            tracks_path=opt.traj_tracks,
+            cameras=training_dataset.viewpoint_stack,
+            batch_size=opt.traj_batch,
+            device="cuda",
+        )
+        print(f"Trajectory loss observations: {traj_loss_fn.num_obs}, anchors: {traj_loss_fn.num_anchors}")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -180,6 +195,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     _, velocity = gaussians.get_current_covariance_and_mean_offset(1.0, gaussians.get_t + 0.1)
                     Lmotion = velocity.norm(p=2, dim=1).mean()
                     loss = loss + opt.lambda_motion * Lmotion
+                ########################
+
+                ###### trajectory loss ######
+                if traj_loss_fn is not None:
+                    Ltraj = traj_loss_fn(gaussians)
+                    loss = loss + opt.lambda_traj * Ltraj
                 ########################
 
                 
@@ -327,6 +348,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 tb_writer.add_scalar('train_loss_patches/smooth_loss', loss_dict['Lsmooth'].item(), iteration)
             if "Llaplacian" in loss_dict:
                 tb_writer.add_scalar('train_loss_patches/laplacian_loss', loss_dict['Llaplacian'].item(), iteration)
+            if "Ltraj" in loss_dict:
+                tb_writer.add_scalar('train_loss_patches/traj_loss', loss_dict['Ltraj'].item(), iteration)
 
     psnr_test_iter = 0.0
                     
@@ -353,6 +376,9 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--iter_end", type=int, default=-1)
+    parser.add_argument("--out_model_path", type=str, default="")
+    parser.add_argument("--no_densify", action="store_true")
     
     parser.add_argument("--gaussian_dim", type=int, default=3)
     parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
@@ -380,6 +406,16 @@ if __name__ == "__main__":
             setattr(args, key, host[key])
     for k in cfg.keys():
         recursive_merge(k, cfg)
+
+    if args.iter_end > 0:
+        args.iterations = args.iter_end
+        args.save_iterations = list(args.save_iterations)
+        if args.iterations not in args.save_iterations:
+            args.save_iterations.append(args.iterations)
+    if args.out_model_path:
+        args.model_path = args.out_model_path
+    if args.no_densify:
+        args.densify_until_iter = 0
             
 
     setup_seed(args.seed)
