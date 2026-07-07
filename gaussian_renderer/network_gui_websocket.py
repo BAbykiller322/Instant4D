@@ -86,7 +86,7 @@ def run_asyncio_loop(wish_host, wish_port):
     asyncio.run(websocket_server(wish_host, wish_port))
 
 def init(wish_host, wish_port):
-    thread = threading.Thread(target=run_asyncio_loop,args=[wish_host, wish_port])
+    thread = threading.Thread(target=run_asyncio_loop, args=[wish_host, wish_port], daemon=True)
     thread.start()
 
 
