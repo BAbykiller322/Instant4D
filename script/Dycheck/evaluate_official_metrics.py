@@ -1,5 +1,8 @@
 import json
+import os
 import sys
+import types
+import importlib.util
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -32,14 +35,63 @@ def load_mask(path):
     return (mask > 0.5).astype(np.float32)[..., None]
 
 
-def require_official_metrics():
+def _masked_mean(x, mask=None):
+    import jax.numpy as jnp
+
+    eps = 1e-6
+    if mask is None:
+        return x.mean()
+    broadcast_to = jnp.broadcast_to if isinstance(x, jnp.ndarray) else np.broadcast_to
+    mask = broadcast_to(mask, x.shape)
+    return (x * mask).sum() / mask.sum().clip(eps)
+
+
+def _install_metrics_stub():
+    dycheck_mod = types.ModuleType("dycheck")
+    nn_mod = types.ModuleType("dycheck.nn")
+    functional_mod = types.ModuleType("dycheck.nn.functional")
+    functional_mod.common = types.SimpleNamespace(masked_mean=_masked_mean)
+    nn_mod.functional = functional_mod
+    dycheck_mod.nn = nn_mod
+    sys.modules["dycheck"] = dycheck_mod
+    sys.modules["dycheck.nn"] = nn_mod
+    sys.modules["dycheck.nn.functional"] = functional_mod
+
+
+def _find_official_image_metrics(dycheck_code_root):
+    candidates = []
+    if dycheck_code_root:
+        candidates.append(Path(dycheck_code_root))
+    if os.environ.get("DYCHECK_CODE_ROOT"):
+        candidates.append(Path(os.environ["DYCHECK_CODE_ROOT"]))
+    for item in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if item:
+            candidates.append(Path(item))
+    candidates.append(Path.home() / "dycheck")
+
+    for root in candidates:
+        path = root / "dycheck" / "core" / "metrics" / "image.py"
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Could not find KAIR-BAIR/dycheck image metrics. Set --dycheck_code_root "
+        "or DYCHECK_CODE_ROOT to the official dycheck repo."
+    )
+
+
+def require_official_metrics(dycheck_code_root=None):
     try:
         import jax.numpy as jnp
-        from dycheck.core import metrics
+
+        metrics_path = _find_official_image_metrics(dycheck_code_root)
+        _install_metrics_stub()
+        spec = importlib.util.spec_from_file_location("dycheck_official_image_metrics", metrics_path)
+        metrics = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(metrics)
     except Exception as exc:
         raise ImportError(
-            "Official DyCheck metrics are required. Set PYTHONPATH to the "
-            "KAIR-BAIR/dycheck repo and install its dependencies."
+            "Official DyCheck image metrics are required. Set --dycheck_code_root "
+            "to the KAIR-BAIR/dycheck repo and install jax/lpips dependencies."
         ) from exc
     return jnp, metrics
 
@@ -50,11 +102,13 @@ def scalar(value):
 
 def build_parser():
     parser = ArgumentParser(description="Evaluate Instant4D predictions with official DyCheck masked metrics.")
-    parser.add_argument("--dycheck_scene_dir", required=True)
-    parser.add_argument("--pred_dir", required=True)
+    parser.add_argument("--dycheck_scene_dir")
+    parser.add_argument("--pred_dir")
     parser.add_argument("--split", default="val")
     parser.add_argument("--image_scale", default="2x")
-    parser.add_argument("--output_json", required=True)
+    parser.add_argument("--output_json")
+    parser.add_argument("--dycheck_code_root", default=os.environ.get("DYCHECK_CODE_ROOT", ""))
+    parser.add_argument("--check_metrics_import", action="store_true")
     parser.add_argument(
         "--allow_missing_predictions",
         action="store_true",
@@ -65,13 +119,21 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    jnp, metrics = require_official_metrics(args.dycheck_code_root)
+    if args.check_metrics_import:
+        metrics.get_compute_lpips()
+        print("Official DyCheck image metrics import OK")
+        return
+
+    if not args.dycheck_scene_dir or not args.pred_dir or not args.output_json:
+        raise ValueError("--dycheck_scene_dir, --pred_dir, and --output_json are required for evaluation")
+
     dycheck_scene_dir = Path(args.dycheck_scene_dir)
     pred_dir = Path(args.pred_dir)
     output_json = Path(args.output_json)
     output_dir = output_json.parent
     per_frame_path = output_dir / "metrics_per_frame.json"
 
-    jnp, metrics = require_official_metrics()
     compute_lpips = metrics.get_compute_lpips()
 
     frame_names = load_frame_names(dycheck_scene_dir / "splits" / f"{args.split}.json")
