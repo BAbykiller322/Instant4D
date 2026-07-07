@@ -97,6 +97,16 @@ class GaussianModel:
         
         self.setup_functions()
 
+    def _set_missing_motion(self):
+        self.motion = nn.Parameter(
+            torch.full(
+                (self._xyz.shape[0],),
+                float("nan"),
+                dtype=self._xyz.dtype,
+                device=self._xyz.device,
+            ).requires_grad_(True)
+        )
+
     def capture(self):
         if self.gaussian_dim == 3:
             return (
@@ -133,7 +143,8 @@ class GaussianModel:
                 self._rotation_r,
                 self.rot_4d,
                 self.env_map,
-                self.active_sh_degree_t
+                self.active_sh_degree_t,
+                self.motion,
             )
     
     def restore(self, model_args, training_args):
@@ -169,7 +180,11 @@ class GaussianModel:
             self._rotation_r,
             self.rot_4d,
             self.env_map,
-            self.active_sh_degree_t) = model_args
+            self.active_sh_degree_t) = model_args[:19]
+            if len(model_args) > 19:
+                self.motion = model_args[19]
+            else:
+                self._set_missing_motion()
         if training_args is not None:
             self.training_setup(training_args)
             self.xyz_gradient_accum = xyz_gradient_accum
