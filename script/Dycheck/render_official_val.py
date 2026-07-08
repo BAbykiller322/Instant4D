@@ -17,8 +17,6 @@ sys.path.insert(0, str(repo_root))
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from scene.cameras import Camera
 
-CAMERA_AXIS_FLIP = np.diag([1.0, -1.0, -1.0])
-
 
 def merge_config_into_args(args, config_path):
     cfg = OmegaConf.load(config_path)
@@ -47,15 +45,13 @@ def dycheck_c2w_from_camera(camera_json):
     orientation = np.asarray(camera_json["orientation"], dtype=np.float64)
     position = np.asarray(camera_json["position"], dtype=np.float64)
     c2w = np.eye(4, dtype=np.float64)
-    c2w[:3, :3] = orientation.T @ CAMERA_AXIS_FLIP
+    c2w[:3, :3] = orientation.T
     c2w[:3, 3] = position
     return c2w
 
 
 def instant_c2w_from_transform(frame):
-    c2w = np.asarray(frame["transform_matrix"], dtype=np.float64).copy()
-    c2w[:3, 1:3] *= -1.0
-    return c2w
+    return np.asarray(frame["transform_matrix"], dtype=np.float64).copy()
 
 
 def estimate_sim3(source_points, target_points):
@@ -96,6 +92,12 @@ def apply_sim3_to_c2w(c2w, scale, rotation, translation):
 
 
 def camera_from_c2w(frame_name, c2w, camera_json, gt_path, timestamp, data_device):
+    c2w = np.asarray(c2w, dtype=np.float64).copy()
+    # DyCheck iPhone transforms in instant4d_source are already in the same
+    # camera convention as the filtered CVD points used to initialize Gaussians.
+    # A second OpenGL/COLMAP axis flip puts all checkpoint Gaussians behind the
+    # camera and produces black renders.
+
     with Image.open(gt_path) as image:
         width, height = image.size
 
@@ -140,6 +142,14 @@ def tensor_to_uint8_image(image):
     image_np = image.detach().cpu().clamp(0.0, 1.0).numpy()
     image_np = np.transpose(image_np, (1, 2, 0))
     return (image_np * 255.0).round().astype(np.uint8)
+
+
+def image_stats(image_np):
+    return {
+        "mean_rgb": float(image_np.mean()),
+        "max_rgb": int(image_np.max()),
+        "nonzero_ratio": float(np.count_nonzero(image_np) / image_np.size),
+    }
 
 
 def load_frame_names(split_path):
@@ -224,6 +234,8 @@ def build_parser():
     parser.add_argument("--max_frames", type=int, default=-1)
     parser.add_argument("--max_alignment_rmse", type=float, default=0.05)
     parser.add_argument("--max_alignment_rot_deg", type=float, default=10.0)
+    parser.add_argument("--sanity_frames", type=int, default=5)
+    parser.add_argument("--min_sanity_mean_rgb", type=float, default=1.0)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000])
@@ -308,6 +320,7 @@ def main():
         old_prediction.unlink()
 
     rendered = []
+    render_stats = []
     for index, frame_name in enumerate(val_names):
         camera_json = load_json(dycheck_scene_dir / "camera" / f"{frame_name}.json")
         raw_c2w = dycheck_c2w_from_camera(camera_json)
@@ -321,7 +334,22 @@ def main():
         gt_path = dycheck_scene_dir / "rgb" / args.image_scale / f"{frame_name}.png"
         camera = camera_from_c2w(frame_name, aligned_c2w, camera_json, gt_path, timestamp, dataset.data_device)
         render_pkg = render(camera.cuda(), gaussians, pipe, background)
-        Image.fromarray(tensor_to_uint8_image(render_pkg["render"])).save(pred_dir / f"{frame_name}.png")
+        image_np = tensor_to_uint8_image(render_pkg["render"])
+        stats = {"frame_name": frame_name}
+        stats.update(image_stats(image_np))
+        render_stats.append(stats)
+
+        if args.sanity_frames > 0 and len(render_stats) == args.sanity_frames:
+            sanity_mean = float(np.mean([item["mean_rgb"] for item in render_stats]))
+            sanity_max = max(item["max_rgb"] for item in render_stats)
+            if sanity_max == 0 or sanity_mean < args.min_sanity_mean_rgb:
+                raise RuntimeError(
+                    "Rendered sanity frames are nearly black. "
+                    f"mean_rgb={sanity_mean:.6f}, max_rgb={sanity_max}. "
+                    "Check camera coordinate conversion before running metrics."
+                )
+
+        Image.fromarray(image_np).save(pred_dir / f"{frame_name}.png")
         rendered.append(frame_name)
         if not args.quiet and (index + 1) % 25 == 0:
             print(f"Rendered {index + 1}/{len(val_names)} frames")
@@ -337,6 +365,12 @@ def main():
         "prediction_dir": str(pred_dir),
         "num_rendered": len(rendered),
         "rendered_frame_names": rendered,
+        "render_stats": {
+            "mean_rgb": float(np.mean([item["mean_rgb"] for item in render_stats])) if render_stats else None,
+            "max_rgb": max([item["max_rgb"] for item in render_stats]) if render_stats else None,
+            "mean_nonzero_ratio": float(np.mean([item["nonzero_ratio"] for item in render_stats])) if render_stats else None,
+            "first_frames": render_stats[: min(10, len(render_stats))],
+        },
         "alignment": {
             "scale": alignment["scale"],
             "rotation": alignment["rotation"].tolist(),
