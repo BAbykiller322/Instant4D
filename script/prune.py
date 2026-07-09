@@ -89,6 +89,9 @@ def read_droid_data(droid_path, motion_path, save_dir):
     B = color.shape[0]
     H_new = color.shape[1]
     W_new = color.shape[2]
+    if motion_prob.shape[0] != B:
+        raise ValueError(
+            f"motion_prob has {motion_prob.shape[0]} frames but CVD has {B}")
     
     
     resized_motion = np.empty((B, H_new, W_new), dtype=np.float32)
@@ -120,14 +123,46 @@ def read_droid_data(droid_path, motion_path, save_dir):
 
     return depth, color, resized_motion, intrinsic, cam_c2w
 
-def process_data(depth, color, motion_prob, intrinsic, cam_c2w):
+def load_split_frame_names(split_path):
+    if split_path is None:
+        return None
+    with open(split_path, "r") as f:
+        split = json.load(f)
+    if "frame_names" in split:
+        return list(split["frame_names"])
+    if "ids" in split:
+        return list(split["ids"])
+    raise KeyError(f"No frame_names or ids in split file: {split_path}")
+
+def frame_time_values(frame_names, fallback_count, time_scale=3.0,
+                      denominator_frame_names=None):
+    if frame_names is None:
+        time_den = max(fallback_count - 1, 1)
+        return np.arange(fallback_count, dtype=np.float32) / time_den * time_scale
+
+    time_ids = np.array([int(name.split("_")[-1]) for name in frame_names],
+                        dtype=np.float32)
+    denom_names = (denominator_frame_names
+                   if denominator_frame_names is not None
+                   else frame_names)
+    denom_ids = np.array([int(name.split("_")[-1]) for name in denom_names],
+                         dtype=np.float32)
+    time_den = max(float(denom_ids.max()), 1.0)
+    return time_ids / time_den * time_scale
+
+def process_data(depth, color, motion_prob, intrinsic, cam_c2w,
+                 frame_times=None):
     B, H, W = depth.shape
 
     xyz = back_project(depth, intrinsic, cam_c2w).reshape(-1, 3)
     rgb = color.reshape(-1, 3).astype(np.float32)/255.0
-    
-    time_stamp = np.repeat(np.arange(B).astype(np.float32)/B*3,
-                           xyz.shape[0]//B)
+
+    if frame_times is None:
+        frame_times = np.arange(B).astype(np.float32) / B * 3
+    frame_times = np.asarray(frame_times, dtype=np.float32)
+    if frame_times.shape[0] != B:
+        raise ValueError(f"frame_times length {frame_times.shape[0]} != B {B}")
+    time_stamp = np.repeat(frame_times, xyz.shape[0]//B)
     time_stamp = time_stamp.reshape(-1, 1)
     
     prob_motion = motion_prob
@@ -163,10 +198,16 @@ def dynamic_static_split(pc, threshold=0.7):
     
     return dynamic_pcd, static_pcd
 
-def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
+def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W,
+                    train_frame_names=None, test_frame_names=None,
+                    train_frame_times=None):
     scale_factor = 480/W
     B = cam_c2w.shape[0]
     print(f"cam_c2w: {cam_c2w.shape}")
+    if train_frame_names is not None and len(train_frame_names) != B:
+        raise ValueError(
+            f"train_frame_names length {len(train_frame_names)} does not match "
+            f"cam_c2w length {B}")
 
     dict_to_save = {}
     dict_to_save["w"]    = int(W * scale_factor)
@@ -178,20 +219,23 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
     dict_to_save["cy"]   = (intrinsic[1, 2] * scale_factor).item()
     frame = []
 
-    selected =   range(B)
-    remaining =  selected
+    selected = range(B)
 
     print(f"selected_len: {len(selected)}")
-    print(f"remaining_len: {len(remaining)}")
+    print(f"heldout_len: {0 if test_frame_names is None else len(test_frame_names)}")
 
     train_frame = []
-    time_den = max(B - 1, 1)
     for i in selected:
+        time_value = (train_frame_times[i].item()
+                      if train_frame_times is not None
+                      else i/max(B - 1, 1)*3)
         frame_dict = {
             "file_path": f"{scene}/{i:05d}",
             "transform_matrix": cam_c2w[i].tolist(),
-            "time": i/time_den*3
+            "time": time_value
         }
+        if train_frame_names is not None:
+            frame_dict["dycheck_frame_name"] = train_frame_names[i]
         train_frame.append(frame_dict)
 
     dict_to_save["frames"] = train_frame
@@ -199,20 +243,16 @@ def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W):
     with open(f"{save_dir}/transforms_train.json", "w") as f:
         json.dump(dict_to_save, f, indent=4)
         
-        
-    test_frame = []
-    for i in remaining:
-        frame_dict = {
-            "file_path": f"{scene}/{i:05d}",
-            "transform_matrix": cam_c2w[i].tolist(),
-            "time": i/time_den*3
-        }
-        test_frame.append(frame_dict)
-
-    dict_to_save["frames"] = test_frame
+    # Held-out RoDyGS iPhone frames are intentionally not exported here:
+    # Mega-SAM/CVD has only seen the train-only split, so there are no CVD poses
+    # or point-cloud samples for test frames in this source directory.
+    dict_to_save["frames"] = []
 
     with open(f"{save_dir}/transforms_test.json", "w") as f:
         json.dump(dict_to_save, f, indent=4)
+    if test_frame_names is not None:
+        with open(f"{save_dir}/rodygs_holdout_frames.json", "w") as f:
+            json.dump({"frame_names": test_frame_names}, f, indent=4)
 def export_source_images(color, save_dir, scene, H, W, image_output_dir=None):
     scale_factor = 480 / W
     out_w = int(W * scale_factor)
@@ -240,12 +280,27 @@ def export_source_images(color, save_dir, scene, H, W, image_output_dir=None):
                target_is_directory=True)
 
 def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
-                 prune_stride=3, image_output_dir=None):
+                 prune_stride=3, image_output_dir=None,
+                 train_split_path=None, test_split_path=None):
     depth, color, motion_prob, intrinsic, cam_c2w = read_droid_data(droid_path, motion_path, save_dir)
-        
+
     B, H, W = depth.shape
+    train_frame_names = load_split_frame_names(train_split_path)
+    test_frame_names = load_split_frame_names(test_split_path)
+    if train_frame_names is not None and len(train_frame_names) != B:
+        raise ValueError(
+            f"train split has {len(train_frame_names)} frames but CVD has {B}")
+    time_denominator_names = train_frame_names
+    if train_frame_names is not None and test_frame_names is not None:
+        time_denominator_names = train_frame_names + test_frame_names
+    train_frame_times = frame_time_values(
+        train_frame_names, B, denominator_frame_names=time_denominator_names)
+
     print(f"depth shape: {depth.shape}")
-    make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W)
+    make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W,
+                    train_frame_names=train_frame_names,
+                    test_frame_names=test_frame_names,
+                    train_frame_times=train_frame_times)
     export_source_images(color, save_dir, scene, H, W, image_output_dir)
     
     # select every 10th frame 
@@ -254,6 +309,7 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     depth = depth[::prune_stride]
     cam_c2w = cam_c2w[::prune_stride]
     motion_prob = motion_prob[::prune_stride]
+    train_frame_times = train_frame_times[::prune_stride]
     
     motion_prob = motion_prob.reshape(-1, 1).astype(np.float32)
     
@@ -264,7 +320,8 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     
 
     
-    pc = process_data(depth, color, motion_prob, intrinsic, cam_c2w)
+    pc = process_data(depth, color, motion_prob, intrinsic, cam_c2w,
+                      frame_times=train_frame_times)
     pcd_dynamic, pcd_static = dynamic_static_split(pc)
     
     mean_depth = np.mean(depth[0])
@@ -286,8 +343,11 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     
     time_stamp_static = np.repeat(1, xyz_static.shape[0])
     scale_time_static = np.repeat(3, xyz_static.shape[0])
-    time_den = max(B - 1, 1)
-    scale_time_dynamic = np.repeat(3/(time_den*10), xyz_dynamic.shape[0])
+    if train_frame_times.shape[0] > 1:
+        dynamic_time_step = float(np.median(np.diff(np.sort(train_frame_times))))
+    else:
+        dynamic_time_step = 3 / max(B - 1, 1)
+    scale_time_dynamic = np.repeat(dynamic_time_step / 10, xyz_dynamic.shape[0])
 
     xyz_sampled = np.concatenate([xyz_static, xyz_dynamic], axis=0)
     rgb_sampled = np.concatenate([rgb_static, rgb_dynamic], axis=0)
@@ -316,6 +376,18 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
             scale_time=scale_time_sampled,
             intrinsic=intrinsic,
             cam_c2w=cam_c2w)
+    manifest = {
+        "scene": scene,
+        "train_split_path": train_split_path,
+        "test_split_path": test_split_path,
+        "num_train_frames": B,
+        "num_pointcloud_frames": int(depth.shape[0]),
+        "prune_stride": prune_stride,
+        "train_frame_names": train_frame_names,
+        "heldout_frame_names": test_frame_names,
+    }
+    with open(f"{save_dir}/source_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=4)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -330,10 +402,16 @@ if __name__ == "__main__":
                         help="frame stride for point-cloud initialization")
     parser.add_argument("--image_output_dir", default=None,
                         help="optional real image export dir; save_dir/scene_name becomes a symlink")
+    parser.add_argument("--train_split_path", default=None,
+                        help="DyCheck/RoDyGS train-only split used to create the CVD input")
+    parser.add_argument("--test_split_path", default=None,
+                        help="DyCheck/RoDyGS held-out split recorded for evaluation")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     voxel_filter(args.droid_path, args.motion_path, args.save_dir,
                  args.scene_name, use_mask=False,
                  prune_stride=args.prune_stride,
-                 image_output_dir=args.image_output_dir)
+                 image_output_dir=args.image_output_dir,
+                 train_split_path=args.train_split_path,
+                 test_split_path=args.test_split_path)

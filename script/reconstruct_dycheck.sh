@@ -13,6 +13,8 @@ Options:
   --cache-root PATH        Intermediate cache root; default: $SCRATCH/instant4d_preprocess_cache.
   --gpu ID                 CUDA_VISIBLE_DEVICES value; default: 0.
   --stride N               Frame stride for mono depth, DroidSLAM, and flow; default: 1.
+  --holdout-period N       RoDyGS iPhone holdout period; default: 8.
+  --holdout-offset N       RoDyGS iPhone holdout offset; default: 4.
   --keep-cache             Keep intermediate cache after final Instant4D source is written.
   --clean-cache            Remove this scene's cache before starting.
 EOF
@@ -26,6 +28,8 @@ STRIDE="1"
 KEEP_CACHE="0"
 CLEAN_CACHE="0"
 CACHE_ROOT="${SCRATCH:-/tmp}/instant4d_preprocess_cache"
+HOLDOUT_PERIOD="8"
+HOLDOUT_OFFSET="4"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +55,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stride)
       STRIDE="$2"
+      shift 2
+      ;;
+    --holdout-period)
+      HOLDOUT_PERIOD="$2"
+      shift 2
+      ;;
+    --holdout-offset)
+      HOLDOUT_OFFSET="$2"
       shift 2
       ;;
     --keep-cache)
@@ -83,11 +95,14 @@ MEGASAM_ROOT="$REPO_ROOT/SLAM/mega-sam"
 SCENE_DIR="$DATA_ROOT/$SCENE"
 IMAGE_DIR="$SCENE_DIR/rgb/$IMAGE_SCALE"
 CAMERA_DIR="$SCENE_DIR/camera"
-SPLIT_PATH="$SCENE_DIR/splits/train.json"
+DYCHECK_TRAIN_SPLIT="$SCENE_DIR/splits/train.json"
 PREPROCESS_ROOT="$SCENE_DIR/preprocess_output"
 CACHE_SCENE_ROOT="$CACHE_ROOT/$SCENE"
 MEGASAM_OUT="$PREPROCESS_ROOT/mega_sam"
 INSTANT4D_SOURCE="$PREPROCESS_ROOT/instant4d_source"
+RODYGS_SPLIT_DIR="$PREPROCESS_ROOT/rodygs_split"
+RODYGS_TRAIN_SPLIT="$RODYGS_SPLIT_DIR/train.json"
+RODYGS_TEST_SPLIT="$RODYGS_SPLIT_DIR/test.json"
 
 if [[ ! -d "$SCENE_DIR" ]]; then
   echo "Scene directory not found: $SCENE_DIR" >&2
@@ -101,8 +116,8 @@ if [[ ! -d "$CAMERA_DIR" ]]; then
   echo "Camera directory not found: $CAMERA_DIR" >&2
   exit 1
 fi
-if [[ ! -f "$SPLIT_PATH" ]]; then
-  echo "Train split not found: $SPLIT_PATH" >&2
+if [[ ! -f "$DYCHECK_TRAIN_SPLIT" ]]; then
+  echo "Train split not found: $DYCHECK_TRAIN_SPLIT" >&2
   exit 1
 fi
 
@@ -110,7 +125,38 @@ if [[ "$CLEAN_CACHE" == "1" ]]; then
   rm -rf "$CACHE_SCENE_ROOT"
 fi
 
-mkdir -p "$CACHE_SCENE_ROOT" "$MEGASAM_OUT" "$INSTANT4D_SOURCE"
+mkdir -p "$CACHE_SCENE_ROOT" "$MEGASAM_OUT" "$INSTANT4D_SOURCE" "$RODYGS_SPLIT_DIR"
+
+python - "$DYCHECK_TRAIN_SPLIT" "$RODYGS_TRAIN_SPLIT" "$RODYGS_TEST_SPLIT" "$HOLDOUT_PERIOD" "$HOLDOUT_OFFSET" <<'PY'
+import json
+import sys
+
+source_path, train_path, test_path, period, offset = sys.argv[1:6]
+period = int(period)
+offset = int(offset)
+with open(source_path, "r", encoding="utf-8") as f:
+    source = json.load(f)
+key = "frame_names" if "frame_names" in source else "ids"
+frame_names = list(source[key])
+
+train_names = []
+test_names = []
+for idx, name in enumerate(frame_names):
+    if (idx + offset) % period == 0:
+        test_names.append(name)
+    else:
+        train_names.append(name)
+
+for path, names in [(train_path, train_names), (test_path, test_names)]:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({key: names}, f, indent=2)
+
+print(
+    f"RoDyGS split from {source_path}: "
+    f"train={len(train_names)}, test={len(test_names)}, "
+    f"rule=(idx + {offset}) % {period} == 0"
+)
+PY
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH="$MEGASAM_ROOT:$MEGASAM_ROOT/UniDepth:${PYTHONPATH:-}"
@@ -128,7 +174,7 @@ echo "=== [1/6] UniDepth: $SCENE ==="
 python UniDepth/scripts/demo_mega-sam.py \
   --scene-name "$SCENE" \
   --img-path "$IMAGE_DIR" \
-  --split-path "$SPLIT_PATH" \
+  --split-path "$RODYGS_TRAIN_SPLIT" \
   --stride "$STRIDE" \
   --outdir "$UNIDEPTH_OUT"
 
@@ -137,7 +183,7 @@ python Depth-Anything/run_videos.py \
   --encoder vitl \
   --load-from Depth-Anything/checkpoints/depth_anything_vitl14.pth \
   --img-path "$IMAGE_DIR" \
-  --split-path "$SPLIT_PATH" \
+  --split-path "$RODYGS_TRAIN_SPLIT" \
   --stride "$STRIDE" \
   --outdir "$DEPTH_ANYTHING_OUT"
 
@@ -145,7 +191,7 @@ echo "=== [3/6] DroidSLAM tracking: $SCENE ==="
 python camera_tracking_scripts/test_dycheck.py \
   --image_path "$IMAGE_DIR" \
   --camera_path "$CAMERA_DIR" \
-  --split_path "$SPLIT_PATH" \
+  --split_path "$RODYGS_TRAIN_SPLIT" \
   --image_downscale "${IMAGE_SCALE%x}" \
   --weights checkpoints/megasam_final.pth \
   --scene_name "$SCENE" \
@@ -159,7 +205,7 @@ python camera_tracking_scripts/test_dycheck.py \
 echo "=== [4/6] RAFT flow cache: $SCENE ==="
 python cvd_opt/preprocess_flow.py \
   --datapath "$IMAGE_DIR" \
-  --split_path "$SPLIT_PATH" \
+  --split_path "$RODYGS_TRAIN_SPLIT" \
   --stride "$STRIDE" \
   --model cvd_opt/raft-things.pth \
   --scene_name "$SCENE" \
@@ -183,7 +229,9 @@ python script/prune.py \
   --save_dir "$INSTANT4D_SOURCE" \
   --scene_name "$SCENE" \
   --image_output_dir "$MEGASAM_OUT/cvd_images" \
-  --prune_stride 3
+  --prune_stride 3 \
+  --train_split_path "$RODYGS_TRAIN_SPLIT" \
+  --test_split_path "$RODYGS_TEST_SPLIT"
 
 cat > "$MEGASAM_OUT/manifest.json" <<EOF
 {
@@ -191,6 +239,11 @@ cat > "$MEGASAM_OUT/manifest.json" <<EOF
   "scene_dir": "$SCENE_DIR",
   "image_scale": "$IMAGE_SCALE",
   "cache_root": "$CACHE_SCENE_ROOT",
+  "dycheck_train_split": "$DYCHECK_TRAIN_SPLIT",
+  "rodygs_train_split": "$RODYGS_TRAIN_SPLIT",
+  "rodygs_test_split": "$RODYGS_TEST_SPLIT",
+  "holdout_period": $HOLDOUT_PERIOD,
+  "holdout_offset": $HOLDOUT_OFFSET,
   "instant4d_source": "$INSTANT4D_SOURCE",
   "cvd_npz": "$CVD_OUT_DIR/${SCENE}_sgd_cvd_hr.npz",
   "droid_npz": "$DROID_OUT_DIR/${SCENE}_droid.npz",
