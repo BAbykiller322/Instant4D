@@ -139,21 +139,30 @@ with open(source_path, "r", encoding="utf-8") as f:
 key = "frame_names" if "frame_names" in source else "ids"
 frame_names = list(source[key])
 
-train_names = []
-test_names = []
-for idx, name in enumerate(frame_names):
+train_indices = []
+test_indices = []
+for idx, _name in enumerate(frame_names):
     if (idx + offset) % period == 0:
-        test_names.append(name)
+        test_indices.append(idx)
     else:
-        train_names.append(name)
+        train_indices.append(idx)
 
-for path, names in [(train_path, train_names), (test_path, test_names)]:
+def slice_split(indices):
+    split = {}
+    for field, value in source.items():
+        if isinstance(value, list) and len(value) == len(frame_names):
+            split[field] = [value[i] for i in indices]
+        else:
+            split[field] = value
+    return split
+
+for path, indices in [(train_path, train_indices), (test_path, test_indices)]:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({key: names}, f, indent=2)
+        json.dump(slice_split(indices), f, indent=2)
 
 print(
     f"RoDyGS split from {source_path}: "
-    f"train={len(train_names)}, test={len(test_names)}, "
+    f"train={len(train_indices)}, test={len(test_indices)}, "
     f"rule=(idx + {offset}) % {period} == 0"
 )
 PY

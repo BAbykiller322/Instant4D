@@ -79,6 +79,34 @@ def estimate_sim3(source_points, target_points):
     return scale, rotation, translation, errors
 
 
+def estimate_sim3_with_rotation(source_points, target_points, source_rotations, target_rotations):
+    source_points = np.asarray(source_points, dtype=np.float64)
+    target_points = np.asarray(target_points, dtype=np.float64)
+    source_rotations = np.asarray(source_rotations, dtype=np.float64)
+    target_rotations = np.asarray(target_rotations, dtype=np.float64)
+    if source_points.shape != target_points.shape or source_points.shape[0] < 3:
+        raise ValueError("Need at least 3 paired cameras for Sim(3) alignment")
+
+    rotation_votes = np.einsum("nij,nkj->nik", target_rotations, source_rotations)
+    U, _singular_values, Vt = np.linalg.svd(rotation_votes.sum(axis=0))
+    D = np.eye(3, dtype=np.float64)
+    D[-1, -1] = np.sign(np.linalg.det(U @ Vt))
+    rotation = U @ D @ Vt
+
+    source_mean = source_points.mean(axis=0)
+    target_mean = target_points.mean(axis=0)
+    source_centered = source_points - source_mean
+    target_centered = target_points - target_mean
+    rotated_source = (rotation @ source_centered.T).T
+    source_var = np.sum(source_centered * source_centered)
+    scale = np.sum(target_centered * rotated_source) / max(source_var, 1e-12)
+    translation = target_mean - scale * rotation @ source_mean
+
+    predicted = apply_sim3_to_points(source_points, scale, rotation, translation)
+    errors = np.linalg.norm(predicted - target_points, axis=1)
+    return scale, rotation, translation, errors
+
+
 def apply_sim3_to_points(points, scale, rotation, translation):
     points = np.asarray(points, dtype=np.float64)
     return (scale * (rotation @ points.T)).T + translation
@@ -162,16 +190,22 @@ def load_frame_names(split_path):
 
 
 def build_alignment(dycheck_scene_dir, source_path, max_alignment_rmse, max_alignment_rot_deg):
-    train_names = load_frame_names(dycheck_scene_dir / "splits" / "train.json")
     train_transforms = load_json(source_path / "transforms_train.json")["frames"]
-    if len(train_names) != len(train_transforms):
-        raise ValueError(
-            f"Train split length {len(train_names)} does not match "
-            f"transforms_train length {len(train_transforms)}"
-        )
+    train_names = [frame.get("dycheck_frame_name") for frame in train_transforms]
+    if not all(train_names):
+        split_train_names = load_frame_names(dycheck_scene_dir / "splits" / "train.json")
+        if len(split_train_names) != len(train_transforms):
+            raise ValueError(
+                f"Train split length {len(split_train_names)} does not match "
+                f"transforms_train length {len(train_transforms)} and "
+                "transforms_train.json does not contain dycheck_frame_name"
+            )
+        train_names = split_train_names
 
     raw_centers = []
     instant_centers = []
+    raw_rotations = []
+    instant_rotations = []
     rotation_errors = []
     for frame_name, instant_frame in zip(train_names, train_transforms):
         raw_camera = load_json(dycheck_scene_dir / "camera" / f"{frame_name}.json")
@@ -179,8 +213,11 @@ def build_alignment(dycheck_scene_dir, source_path, max_alignment_rmse, max_alig
         instant_c2w = instant_c2w_from_transform(instant_frame)
         raw_centers.append(raw_c2w[:3, 3])
         instant_centers.append(instant_c2w[:3, 3])
+        raw_rotations.append(raw_c2w[:3, :3])
+        instant_rotations.append(instant_c2w[:3, :3])
 
-    scale, rotation, translation, center_errors = estimate_sim3(raw_centers, instant_centers)
+    scale, rotation, translation, center_errors = estimate_sim3_with_rotation(
+        raw_centers, instant_centers, raw_rotations, instant_rotations)
 
     for frame_name, instant_frame in zip(train_names, train_transforms):
         raw_camera = load_json(dycheck_scene_dir / "camera" / f"{frame_name}.json")
