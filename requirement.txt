@@ -4,6 +4,7 @@ torch-scatter
 plyfile
 tqdm
 torchmetrics
+piqa
 imagesize
 kornia
 omegaconf

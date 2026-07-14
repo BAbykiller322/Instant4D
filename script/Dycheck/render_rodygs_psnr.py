@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from script.Dycheck.render_official_val import (
     load_json,
     tensor_to_uint8_image,
 )
+
+RETAIN_RENDER_INTERVAL = 50
 
 
 def merge_config_into_args(args, config_path):
@@ -52,6 +55,110 @@ def psnr_float(pred, gt):
     return float(20.0 * math.log10(1.0 / math.sqrt(mse)))
 
 
+class FullImageMetricEvaluator:
+    def __init__(self, device):
+        try:
+            from piqa import LPIPS, SSIM
+        except ImportError as exc:
+            raise ImportError(
+                "RoDyGS full-image SSIM/LPIPS metrics require piqa. "
+                "Install it in the Instant4D environment with `pip install piqa`."
+            ) from exc
+
+        self.ssim = SSIM().to(device).eval()
+        self.lpips = LPIPS(network="alex").to(device).eval()
+        self.device = device
+
+    def tensor_from_rgb(self, image):
+        if image.dtype == np.uint8:
+            image = image.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
+        return tensor.to(self.device, dtype=torch.float32).clamp(0.0, 1.0)
+
+    def evaluate(self, pred, gt):
+        pred_tensor = self.tensor_from_rgb(pred)
+        gt_tensor = self.tensor_from_rgb(gt)
+        with torch.inference_mode():
+            return {
+                "ssim": float(self.ssim(gt_tensor, pred_tensor).detach().cpu()),
+                "lpips": float(self.lpips(gt_tensor, pred_tensor).detach().cpu()),
+            }
+
+
+def frame_numeric_id(frame_name):
+    matches = re.findall(r"\d+", frame_name)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
+def source_train_frame_count(source_path):
+    transforms_path = source_path / "transforms_train.json"
+    if not transforms_path.exists():
+        return None
+    transforms = load_json(transforms_path)
+    return len(transforms.get("frames", []))
+
+
+def sampled_render_keep_names(frame_names, source_path, interval=RETAIN_RENDER_INTERVAL):
+    if not frame_names:
+        return set(), []
+
+    train_count = source_train_frame_count(source_path)
+    if not train_count:
+        train_count = len(frame_names)
+
+    frame_ids = [frame_numeric_id(name) for name in frame_names]
+    if any(frame_id is None for frame_id in frame_ids):
+        keep = frame_names[::interval]
+        return set(keep), keep
+
+    targets = range(0, train_count, interval)
+    selected = []
+    used = set()
+    for target in targets:
+        best_index = min(
+            (idx for idx in range(len(frame_names)) if idx not in used),
+            key=lambda idx: (abs(frame_ids[idx] - target), idx),
+            default=None,
+        )
+        if best_index is None:
+            break
+        used.add(best_index)
+        selected.append(frame_names[best_index])
+    return set(selected), selected
+
+
+def prune_rendered_images(per_frame, pred_dir, source_path):
+    keep_names, keep_order = sampled_render_keep_names(
+        [item["frame_name"] for item in per_frame],
+        source_path,
+    )
+    deleted = []
+    retained = []
+    for item in per_frame:
+        pred_path = Path(item["pred_path"])
+        keep = item["frame_name"] in keep_names
+        item["render_retained"] = keep
+        if keep:
+            retained.append(item["frame_name"])
+            continue
+        if pred_path.parent != pred_dir:
+            raise RuntimeError(f"Refusing to delete render outside prediction directory: {pred_path}")
+        if pred_path.exists():
+            pred_path.unlink()
+            deleted.append(item["frame_name"])
+
+    return {
+        "enabled": True,
+        "interval": RETAIN_RENDER_INTERVAL,
+        "selection": "nearest evaluated frame to each source-train timeline interval",
+        "retained_frame_names": keep_order,
+        "num_retained": len(retained),
+        "num_deleted": len(deleted),
+    }
+
+
 def default_holdout_path(dycheck_scene_dir, source_path):
     candidates = [
         source_path / "rodygs_holdout_frames.json",
@@ -68,7 +175,7 @@ def default_holdout_path(dycheck_scene_dir, source_path):
 
 def build_parser():
     parser = ArgumentParser(
-        description="Render and evaluate Instant4D with the RoDyGS iPhone holdout PSNR protocol."
+        description="Render and evaluate Instant4D with RoDyGS iPhone holdout full-image metrics."
     )
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -85,6 +192,7 @@ def build_parser():
     parser.add_argument("--max_alignment_rot_deg", type=float, default=10.0)
     parser.add_argument("--sanity_frames", type=int, default=5)
     parser.add_argument("--min_sanity_mean_rgb", type=float, default=1.0)
+    parser.add_argument("--retain_sampled_renders", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000])
@@ -158,6 +266,7 @@ def main():
     gaussians.restore(model_params, None)
     if gaussians.env_map is not None and hasattr(gaussians.env_map, "shape") and gaussians.env_map.shape[0] > 0:
         pipe.env_map_res = gaussians.env_map.shape[0]
+    metric_evaluator = FullImageMetricEvaluator("cuda")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -207,10 +316,13 @@ def main():
         gt = load_rgb_float(gt_path)
         if pred.shape != gt.shape:
             raise ValueError(f"Shape mismatch for {frame_name}: pred {pred.shape}, gt {gt.shape}")
+        image_metrics = metric_evaluator.evaluate(pred, gt)
         per_frame.append(
             {
                 "frame_name": frame_name,
                 "psnr": psnr_float(pred, gt),
+                "ssim": image_metrics["ssim"],
+                "lpips": image_metrics["lpips"],
                 "pred_path": str(pred_path),
                 "gt_path": str(gt_path),
             }
@@ -219,8 +331,14 @@ def main():
             print(f"Rendered/evaluated {index + 1}/{len(frame_names)} frames")
 
     psnr_values = [item["psnr"] for item in per_frame]
+    ssim_values = [item["ssim"] for item in per_frame]
+    lpips_values = [item["lpips"] for item in per_frame]
+    render_retention = {"enabled": False}
+    if args.retain_sampled_renders:
+        render_retention = prune_rendered_images(per_frame, pred_dir, source_path)
+
     summary = {
-        "protocol": "rodygs_iphone_holdout_psnr",
+        "protocol": "rodygs_iphone_holdout_full_image",
         "checkpoint": str(checkpoint_path),
         "checkpoint_iteration": int(checkpoint_iter),
         "dycheck_scene_dir": str(dycheck_scene_dir),
@@ -232,6 +350,13 @@ def main():
         "num_frames": len(frame_names),
         "num_evaluated_frames": len(per_frame),
         "psnr": float(np.mean(psnr_values)) if psnr_values else None,
+        "ssim": float(np.mean(ssim_values)) if ssim_values else None,
+        "lpips": float(np.mean(lpips_values)) if lpips_values else None,
+        "metric_details": {
+            "psnr": "Full-image RGB PSNR on RoDyGS-style held-out frames.",
+            "ssim": "Full-image SSIM from piqa.SSIM on RGB tensors in [0, 1].",
+            "lpips": "Full-image LPIPS from piqa.LPIPS with AlexNet backbone on RGB tensors in [0, 1].",
+        },
         "alignment": {
             "scale": alignment["scale"],
             "rotation": alignment["rotation"].tolist(),
@@ -251,6 +376,7 @@ def main():
             "mean_nonzero_ratio": float(np.mean([item["nonzero_ratio"] for item in render_stats])) if render_stats else None,
             "first_frames": render_stats[: min(10, len(render_stats))],
         },
+        "render_retention": render_retention,
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
