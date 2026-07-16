@@ -380,7 +380,7 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': 0.0, "name": "rotation"},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
         ]
         if self.gaussian_dim == 4: # TODO: tune time_lr_scale
             if training_args.position_t_lr_init < 0:
@@ -389,7 +389,7 @@ class GaussianModel:
             l.append({'params': [self._t], 'lr': training_args.position_t_lr_init * self.spatial_lr_scale, "name": "t"})
             l.append({'params': [self._scaling_t], 'lr': training_args.scaling_lr, "name": "scaling_t"})
             if self.rot_4d:
-                l.append({'params': [self._rotation_r], 'lr': 0.0, "name": "rotation_r"})
+                l.append({'params': [self._rotation_r], 'lr': training_args.rotation_lr, "name": "rotation_r"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
