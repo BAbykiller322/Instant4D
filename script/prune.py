@@ -9,6 +9,7 @@ class pcd (NamedTuple):
     rgb: np.ndarray
     prob_motion: np.ndarray
     time_stamp: np.ndarray
+    temporal_motion: np.ndarray
 
 def downsample_point_cloud_on_voxel_grid(voxel_size, xyz, *features):
     """Numpy replacement for point_cloud_utils voxel-grid downsampling."""
@@ -34,7 +35,7 @@ def downsample_point_cloud_on_voxel_grid(voxel_size, xyz, *features):
 def back_project(depth, intrinsic, cam_c2w):
     """
     Vectorized back-projection of depth maps to 3D points in world coordinates.
-    
+
     Args:
         depth: B, H, W numpy array
         intrinsic: 3, 3 numpy array
@@ -123,6 +124,27 @@ def read_droid_data(droid_path, motion_path, save_dir):
 
     return depth, color, resized_motion, intrinsic, cam_c2w
 
+def load_temporal_motion_mask(mask_path, num_frames, height, width):
+    if mask_path is None:
+        return np.zeros((num_frames, height, width), dtype=np.float32)
+
+    mask = np.load(mask_path)
+    if mask.shape[0] != num_frames:
+        raise ValueError(
+            f"temporal motion mask has {mask.shape[0]} frames but CVD has {num_frames}")
+
+    resized = np.empty((num_frames, height, width), dtype=np.float32)
+    for i in range(num_frames):
+        frame_mask = mask[i].astype(np.float32)
+        if frame_mask.shape != (height, width):
+            frame_mask = cv2.resize(
+                frame_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        resized[i] = frame_mask
+
+    print(f"temporal_motion_mask shape: {resized.shape}")
+    print(f"temporal_motion_mask ratio: {float((resized > 0.5).mean()):.6f}")
+    return resized
+
 def load_split_frame_names(split_path):
     if split_path is None:
         return None
@@ -151,7 +173,7 @@ def frame_time_values(frame_names, fallback_count, time_scale=3.0,
     return time_ids / time_den * time_scale
 
 def process_data(depth, color, motion_prob, intrinsic, cam_c2w,
-                 frame_times=None):
+                 frame_times=None, temporal_motion=None):
     B, H, W = depth.shape
 
     xyz = back_project(depth, intrinsic, cam_c2w).reshape(-1, 3)
@@ -166,11 +188,20 @@ def process_data(depth, color, motion_prob, intrinsic, cam_c2w,
     time_stamp = time_stamp.reshape(-1, 1)
     
     prob_motion = motion_prob
+    if temporal_motion is None:
+        temporal_motion = np.zeros((B, H, W), dtype=np.float32)
+    temporal_motion = temporal_motion.reshape(-1, 1).astype(np.float32)
 
     print(f"prob_motion range from {np.min(prob_motion)} to {np.max(prob_motion)}")
     print(f"prob_motion shape: {prob_motion.shape}")
+    print(f"temporal_motion shape: {temporal_motion.shape}")
     
-    pc = pcd(xyz=xyz, rgb=rgb, prob_motion=prob_motion, time_stamp=time_stamp)
+    pc = pcd(
+        xyz=xyz,
+        rgb=rgb,
+        prob_motion=prob_motion,
+        time_stamp=time_stamp,
+        temporal_motion=temporal_motion)
     
     return pc
 
@@ -187,33 +218,80 @@ def dynamic_static_split(pc, threshold=0.7):
     rgb_dynamic = pc.rgb[dynamic_region]
     prob_motion_dynamic = pc.prob_motion[dynamic_region]
     time_stamp_dynamic = pc.time_stamp[dynamic_region]
+    temporal_motion_dynamic = pc.temporal_motion[dynamic_region]
 
     xyz_static = pc.xyz[static_region]
     rgb_static = pc.rgb[static_region]
     prob_motion_static = pc.prob_motion[static_region]
     time_stamp_static  = pc.time_stamp[static_region]
-    
-    dynamic_pcd = pcd(xyz=xyz_dynamic, rgb=rgb_dynamic, prob_motion=prob_motion_dynamic, time_stamp=time_stamp_dynamic)
-    static_pcd =  pcd(xyz=xyz_static,  rgb=rgb_static,  prob_motion=prob_motion_static,  time_stamp=time_stamp_static)
+    temporal_motion_static = pc.temporal_motion[static_region]
+
+    dynamic_pcd = pcd(
+        xyz=xyz_dynamic,
+        rgb=rgb_dynamic,
+        prob_motion=prob_motion_dynamic,
+        time_stamp=time_stamp_dynamic,
+        temporal_motion=temporal_motion_dynamic)
+    static_pcd = pcd(
+        xyz=xyz_static,
+        rgb=rgb_static,
+        prob_motion=prob_motion_static,
+        time_stamp=time_stamp_static,
+        temporal_motion=temporal_motion_static)
     
     return dynamic_pcd, static_pcd
 
-def initialize_temporal_attributes(xyz_static, xyz_dynamic, time_stamp_dynamic,
+def initialize_temporal_attributes(xyz_static, xyz_dynamic,
+                                   time_stamp_static_in,
+                                   time_stamp_dynamic_in,
+                                   temporal_motion_static,
+                                   temporal_motion_dynamic,
                                    train_frame_times, num_frames,
-                                   temporal_init_mode):
+                                   temporal_init_mode,
+                                   temporal_motion_threshold=0.5,
+                                   temporal_dynamic_scale_floor=0.0):
     time_stamp_static = np.repeat(1, xyz_static.shape[0])
     scale_time_static = np.repeat(3, xyz_static.shape[0])
     if train_frame_times.shape[0] > 1:
         dynamic_time_step = float(np.median(np.diff(np.sort(train_frame_times))))
     else:
         dynamic_time_step = 3 / max(num_frames - 1, 1)
+    dynamic_scale_time = max(dynamic_time_step / 10,
+                             float(temporal_dynamic_scale_floor))
 
     if temporal_init_mode == "motion_split":
-        time_stamp_dynamic_out = time_stamp_dynamic.squeeze()
-        scale_time_dynamic = np.repeat(dynamic_time_step / 10, xyz_dynamic.shape[0])
+        temporal_dynamic_static = np.zeros(xyz_static.shape[0], dtype=bool)
+        temporal_dynamic_dynamic = np.ones(xyz_dynamic.shape[0], dtype=bool)
+        time_stamp_dynamic_out = time_stamp_dynamic_in.squeeze()
+        scale_time_dynamic = np.repeat(dynamic_scale_time, xyz_dynamic.shape[0])
     elif temporal_init_mode == "all_static":
+        temporal_dynamic_static = np.zeros(xyz_static.shape[0], dtype=bool)
+        temporal_dynamic_dynamic = np.zeros(xyz_dynamic.shape[0], dtype=bool)
         time_stamp_dynamic_out = np.repeat(1, xyz_dynamic.shape[0])
         scale_time_dynamic = np.repeat(3, xyz_dynamic.shape[0])
+    elif temporal_init_mode == "temporal_motion_mask":
+        temporal_dynamic_static = (
+            temporal_motion_static.squeeze() >= temporal_motion_threshold)
+        temporal_dynamic_dynamic = (
+            temporal_motion_dynamic.squeeze() >= temporal_motion_threshold)
+
+        time_stamp_static = np.where(
+            temporal_dynamic_static,
+            time_stamp_static_in.squeeze(),
+            1).astype(np.float32)
+        scale_time_static = np.where(
+            temporal_dynamic_static,
+            dynamic_scale_time,
+            3).astype(np.float32)
+
+        time_stamp_dynamic_out = np.where(
+            temporal_dynamic_dynamic,
+            time_stamp_dynamic_in.squeeze(),
+            1).astype(np.float32)
+        scale_time_dynamic = np.where(
+            temporal_dynamic_dynamic,
+            dynamic_scale_time,
+            3).astype(np.float32)
     else:
         raise ValueError(f"Unknown temporal_init_mode: {temporal_init_mode}")
 
@@ -223,6 +301,8 @@ def initialize_temporal_attributes(xyz_static, xyz_dynamic, time_stamp_dynamic,
         time_stamp_dynamic_out,
         scale_time_dynamic,
         dynamic_time_step,
+        temporal_dynamic_static,
+        temporal_dynamic_dynamic,
     )
 
 def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W,
@@ -309,10 +389,15 @@ def export_source_images(color, save_dir, scene, H, W, image_output_dir=None):
 def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
                  prune_stride=3, image_output_dir=None,
                  train_split_path=None, test_split_path=None,
-                 temporal_init_mode="motion_split"):
+                 temporal_init_mode="motion_split",
+                 temporal_motion_mask_path=None,
+                 temporal_motion_threshold=0.5,
+                 temporal_dynamic_scale_floor=0.0):
     depth, color, motion_prob, intrinsic, cam_c2w = read_droid_data(droid_path, motion_path, save_dir)
 
     B, H, W = depth.shape
+    temporal_motion = load_temporal_motion_mask(
+        temporal_motion_mask_path, B, H, W)
     train_frame_names = load_split_frame_names(train_split_path)
     test_frame_names = load_split_frame_names(test_split_path)
     if train_frame_names is not None and len(train_frame_names) != B:
@@ -337,6 +422,7 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     depth = depth[::prune_stride]
     cam_c2w = cam_c2w[::prune_stride]
     motion_prob = motion_prob[::prune_stride]
+    temporal_motion = temporal_motion[::prune_stride]
     train_frame_times = train_frame_times[::prune_stride]
     
     motion_prob = motion_prob.reshape(-1, 1).astype(np.float32)
@@ -349,7 +435,8 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
 
     
     pc = process_data(depth, color, motion_prob, intrinsic, cam_c2w,
-                      frame_times=train_frame_times)
+                      frame_times=train_frame_times,
+                      temporal_motion=temporal_motion)
     pcd_dynamic, pcd_static = dynamic_static_split(pc)
     
     mean_depth = np.mean(depth[0])
@@ -359,12 +446,33 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     voxel_size_dynamic = mean_depth / focal * 0.5
     voxel_size_static  = mean_depth / focal * 2
     
-    xyz_static, rgb_static, prob_motion_static = downsample_point_cloud_on_voxel_grid(
-        voxel_size_static, pcd_static.xyz, pcd_static.rgb, pcd_static.prob_motion)
+    (
+        xyz_static,
+        rgb_static,
+        prob_motion_static,
+        time_stamp_static_in,
+        temporal_motion_static,
+    ) = downsample_point_cloud_on_voxel_grid(
+        voxel_size_static,
+        pcd_static.xyz,
+        pcd_static.rgb,
+        pcd_static.prob_motion,
+        pcd_static.time_stamp,
+        pcd_static.temporal_motion)
     
-    xyz_dynamic, rgb_dynamic, prob_motion_dynamic, time_stamp_dynamic = downsample_point_cloud_on_voxel_grid(
-        voxel_size_dynamic, pcd_dynamic.xyz, pcd_dynamic.rgb,
-        pcd_dynamic.prob_motion, pcd_dynamic.time_stamp)
+    (
+        xyz_dynamic,
+        rgb_dynamic,
+        prob_motion_dynamic,
+        time_stamp_dynamic,
+        temporal_motion_dynamic,
+    ) = downsample_point_cloud_on_voxel_grid(
+        voxel_size_dynamic,
+        pcd_dynamic.xyz,
+        pcd_dynamic.rgb,
+        pcd_dynamic.prob_motion,
+        pcd_dynamic.time_stamp,
+        pcd_dynamic.temporal_motion)
     
     
 
@@ -374,18 +482,27 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
         time_stamp_dynamic_out,
         scale_time_dynamic,
         dynamic_time_step,
+        temporal_dynamic_static,
+        temporal_dynamic_dynamic,
     ) = initialize_temporal_attributes(
         xyz_static,
         xyz_dynamic,
+        time_stamp_static_in,
         time_stamp_dynamic,
+        temporal_motion_static,
+        temporal_motion_dynamic,
         train_frame_times,
         B,
         temporal_init_mode,
+        temporal_motion_threshold=temporal_motion_threshold,
+        temporal_dynamic_scale_floor=temporal_dynamic_scale_floor,
     )
 
     xyz_sampled = np.concatenate([xyz_static, xyz_dynamic], axis=0)
     rgb_sampled = np.concatenate([rgb_static, rgb_dynamic], axis=0)
     prob_motion_sampled = np.concatenate([prob_motion_static.squeeze(), prob_motion_dynamic.squeeze()], axis=0)
+    temporal_motion_sampled = np.concatenate([temporal_motion_static.squeeze(), temporal_motion_dynamic.squeeze()], axis=0)
+    temporal_dynamic_sampled = np.concatenate([temporal_dynamic_static, temporal_dynamic_dynamic], axis=0)
     time_stamp_sampled =  np.concatenate([time_stamp_static.squeeze(),  time_stamp_dynamic_out.squeeze()], axis=0)
     scale_time_sampled = np.concatenate([scale_time_static, scale_time_dynamic], axis=0)
     # xyz_sampled = xyz_static
@@ -401,13 +518,19 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     print(f"xyz_sampled: {xyz_sampled.shape}")
     print(f"time_stamp: {time_stamp_sampled.shape}")
     print(f"prob_motion: {prob_motion_sampled.shape}")
+    print(f"temporal_motion: {temporal_motion_sampled.shape}")
+    print(f"temporal_dynamic_count: {int(temporal_dynamic_sampled.sum())}")
     print(f"scale_time: {scale_time_sampled.shape}")
     print(f"temporal_init_mode: {temporal_init_mode}")
+    print(f"temporal_motion_threshold: {temporal_motion_threshold}")
+    print(f"temporal_dynamic_scale_floor: {temporal_dynamic_scale_floor}")
     print(f"dynamic_time_step: {dynamic_time_step}")
     np.savez(f"{save_dir}/filtered_cvd.npz", 
             xyz=xyz_sampled,
             rgb=rgb_sampled,
             prob_motion=prob_motion_sampled,
+            temporal_motion=temporal_motion_sampled,
+            temporal_dynamic=temporal_dynamic_sampled.astype(np.uint8),
             time_stamp=time_stamp_sampled,
             scale_time=scale_time_sampled,
             intrinsic=intrinsic,
@@ -420,6 +543,11 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
         "num_pointcloud_frames": int(depth.shape[0]),
         "prune_stride": prune_stride,
         "temporal_init_mode": temporal_init_mode,
+        "temporal_motion_mask_path": temporal_motion_mask_path,
+        "temporal_motion_threshold": temporal_motion_threshold,
+        "temporal_dynamic_scale_floor": temporal_dynamic_scale_floor,
+        "temporal_dynamic_count": int(temporal_dynamic_sampled.sum()),
+        "temporal_dynamic_ratio": float(temporal_dynamic_sampled.mean()),
         "dynamic_time_step": dynamic_time_step,
         "train_frame_names": train_frame_names,
         "heldout_frame_names": test_frame_names,
@@ -445,10 +573,21 @@ if __name__ == "__main__":
     parser.add_argument("--test_split_path", default=None,
                         help="DyCheck/RoDyGS held-out split recorded for evaluation")
     parser.add_argument("--temporal_init_mode",
-                        choices=["motion_split", "all_static"],
+                        choices=["motion_split", "all_static",
+                                 "temporal_motion_mask"],
                         default="motion_split",
                         help="Temporal t/scale_time init; spatial voxel split still uses motion_prob")
+    parser.add_argument("--temporal_motion_mask_path", default=None,
+                        help="optional B,H,W mask used when temporal_init_mode=temporal_motion_mask")
+    parser.add_argument("--temporal_motion_threshold", type=float, default=0.5,
+                        help="threshold for temporal_motion_mask mode")
+    parser.add_argument("--temporal_dynamic_scale_floor", type=float, default=0.0,
+                        help="minimum scale_time for temporal-dynamic points")
     args = parser.parse_args()
+
+    if args.temporal_init_mode == "temporal_motion_mask" and args.temporal_motion_mask_path is None:
+        raise ValueError(
+            "--temporal_motion_mask_path is required for temporal_motion_mask mode")
 
     os.makedirs(args.save_dir, exist_ok=True)
     voxel_filter(args.droid_path, args.motion_path, args.save_dir,
@@ -457,4 +596,7 @@ if __name__ == "__main__":
                  image_output_dir=args.image_output_dir,
                  train_split_path=args.train_split_path,
                  test_split_path=args.test_split_path,
-                 temporal_init_mode=args.temporal_init_mode)
+                 temporal_init_mode=args.temporal_init_mode,
+                 temporal_motion_mask_path=args.temporal_motion_mask_path,
+                 temporal_motion_threshold=args.temporal_motion_threshold,
+                 temporal_dynamic_scale_floor=args.temporal_dynamic_scale_floor)

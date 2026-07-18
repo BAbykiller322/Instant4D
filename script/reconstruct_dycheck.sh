@@ -13,7 +13,13 @@ Options:
   --cache-root PATH        Intermediate cache root; default: $SCRATCH/instant4d_preprocess_cache.
   --gpu ID                 CUDA_VISIBLE_DEVICES value; default: 0.
   --stride N               Frame stride for mono depth, DroidSLAM, and flow; default: 1.
-  --temporal-init-mode M   Source temporal init: motion_split or all_static; default: motion_split.
+  --temporal-init-mode M   Source temporal init: motion_split, all_static, or temporal_motion_mask; default: motion_split.
+  --temporal-motion-mask-path PATH
+                           Optional temporal motion mask output/input path.
+  --temporal-motion-threshold X
+                           Threshold for temporal_motion_mask source export; default: 0.5.
+  --temporal-dynamic-scale-floor X
+                           Minimum scale_time for temporal-dynamic points; default: 0.0.
   --keep-cache             Keep intermediate cache after final Instant4D source is written.
   --clean-cache            Remove this scene's cache before starting.
 EOF
@@ -27,6 +33,9 @@ STRIDE="1"
 KEEP_CACHE="0"
 CLEAN_CACHE="0"
 TEMPORAL_INIT_MODE="motion_split"
+TEMPORAL_MOTION_MASK_PATH=""
+TEMPORAL_MOTION_THRESHOLD="0.5"
+TEMPORAL_DYNAMIC_SCALE_FLOOR="0.0"
 CACHE_ROOT="${SCRATCH:-/tmp}/instant4d_preprocess_cache"
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +66,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --temporal-init-mode)
       TEMPORAL_INIT_MODE="$2"
+      shift 2
+      ;;
+    --temporal-motion-mask-path)
+      TEMPORAL_MOTION_MASK_PATH="$2"
+      shift 2
+      ;;
+    --temporal-motion-threshold)
+      TEMPORAL_MOTION_THRESHOLD="$2"
+      shift 2
+      ;;
+    --temporal-dynamic-scale-floor)
+      TEMPORAL_DYNAMIC_SCALE_FLOOR="$2"
       shift 2
       ;;
     --keep-cache)
@@ -129,6 +150,9 @@ RECON_DIR="$CACHE_SCENE_ROOT/reconstructions"
 FLOW_CACHE_DIR="$CACHE_SCENE_ROOT/cache_flow"
 DROID_OUT_DIR="$MEGASAM_OUT/droid"
 CVD_OUT_DIR="$MEGASAM_OUT/outputs_cvd"
+if [[ -z "$TEMPORAL_MOTION_MASK_PATH" ]]; then
+  TEMPORAL_MOTION_MASK_PATH="$MEGASAM_OUT/temporal_motion_mask.npy"
+fi
 
 cd "$MEGASAM_ROOT"
 
@@ -183,10 +207,20 @@ python cvd_opt/cvd_opt.py \
   --w_grad 2.0 \
   --w_normal 5.0
 
+if [[ "$TEMPORAL_INIT_MODE" == "temporal_motion_mask" ]]; then
+  echo "=== [5.5/6] Temporal motion mask: $SCENE ==="
+  cd "$REPO_ROOT"
+  python script/make_temporal_motion_mask.py \
+    --cvd_path "$CVD_OUT_DIR/${SCENE}_sgd_cvd_hr.npz" \
+    --flow_dir "$FLOW_CACHE_DIR/$SCENE" \
+    --out_path "$TEMPORAL_MOTION_MASK_PATH" \
+    --debug_dir "$MEGASAM_OUT/temporal_motion_mask_debug"
+fi
+
 echo "=== [6/6] Instant4D source export: $SCENE ==="
 cd "$REPO_ROOT"
 rm -f "$INSTANT4D_SOURCE/rodygs_holdout_frames.json"
-python script/prune.py \
+PRUNE_ARGS=(
   --droid_path "$CVD_OUT_DIR/${SCENE}_sgd_cvd_hr.npz" \
   --motion_path "$RECON_DIR/$SCENE/motion_prob.npy" \
   --save_dir "$INSTANT4D_SOURCE" \
@@ -194,7 +228,14 @@ python script/prune.py \
   --image_output_dir "$MEGASAM_OUT/cvd_images" \
   --prune_stride 3 \
   --temporal_init_mode "$TEMPORAL_INIT_MODE" \
+  --temporal_motion_threshold "$TEMPORAL_MOTION_THRESHOLD" \
+  --temporal_dynamic_scale_floor "$TEMPORAL_DYNAMIC_SCALE_FLOOR" \
   --train_split_path "$DYCHECK_TRAIN_SPLIT"
+)
+if [[ "$TEMPORAL_INIT_MODE" == "temporal_motion_mask" ]]; then
+  PRUNE_ARGS+=(--temporal_motion_mask_path "$TEMPORAL_MOTION_MASK_PATH")
+fi
+python script/prune.py "${PRUNE_ARGS[@]}"
 
 cat > "$MEGASAM_OUT/manifest.json" <<EOF
 {
@@ -209,6 +250,9 @@ cat > "$MEGASAM_OUT/manifest.json" <<EOF
   "cvd_npz": "$CVD_OUT_DIR/${SCENE}_sgd_cvd_hr.npz",
   "droid_npz": "$DROID_OUT_DIR/${SCENE}_droid.npz",
   "temporal_init_mode": "$TEMPORAL_INIT_MODE",
+  "temporal_motion_mask_path": "$TEMPORAL_MOTION_MASK_PATH",
+  "temporal_motion_threshold": $TEMPORAL_MOTION_THRESHOLD,
+  "temporal_dynamic_scale_floor": $TEMPORAL_DYNAMIC_SCALE_FLOOR,
   "stride": $STRIDE
 }
 EOF
