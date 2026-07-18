@@ -198,6 +198,33 @@ def dynamic_static_split(pc, threshold=0.7):
     
     return dynamic_pcd, static_pcd
 
+def initialize_temporal_attributes(xyz_static, xyz_dynamic, time_stamp_dynamic,
+                                   train_frame_times, num_frames,
+                                   temporal_init_mode):
+    time_stamp_static = np.repeat(1, xyz_static.shape[0])
+    scale_time_static = np.repeat(3, xyz_static.shape[0])
+    if train_frame_times.shape[0] > 1:
+        dynamic_time_step = float(np.median(np.diff(np.sort(train_frame_times))))
+    else:
+        dynamic_time_step = 3 / max(num_frames - 1, 1)
+
+    if temporal_init_mode == "motion_split":
+        time_stamp_dynamic_out = time_stamp_dynamic.squeeze()
+        scale_time_dynamic = np.repeat(dynamic_time_step / 10, xyz_dynamic.shape[0])
+    elif temporal_init_mode == "all_static":
+        time_stamp_dynamic_out = np.repeat(1, xyz_dynamic.shape[0])
+        scale_time_dynamic = np.repeat(3, xyz_dynamic.shape[0])
+    else:
+        raise ValueError(f"Unknown temporal_init_mode: {temporal_init_mode}")
+
+    return (
+        time_stamp_static,
+        scale_time_static,
+        time_stamp_dynamic_out,
+        scale_time_dynamic,
+        dynamic_time_step,
+    )
+
 def make_transforms(intrinsic, cam_c2w, save_dir, scene, H, W,
                     train_frame_names=None, test_frame_names=None,
                     train_frame_times=None):
@@ -281,7 +308,8 @@ def export_source_images(color, save_dir, scene, H, W, image_output_dir=None):
 
 def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
                  prune_stride=3, image_output_dir=None,
-                 train_split_path=None, test_split_path=None):
+                 train_split_path=None, test_split_path=None,
+                 temporal_init_mode="motion_split"):
     depth, color, motion_prob, intrinsic, cam_c2w = read_droid_data(droid_path, motion_path, save_dir)
 
     B, H, W = depth.shape
@@ -340,19 +368,25 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     
     
 
-    
-    time_stamp_static = np.repeat(1, xyz_static.shape[0])
-    scale_time_static = np.repeat(3, xyz_static.shape[0])
-    if train_frame_times.shape[0] > 1:
-        dynamic_time_step = float(np.median(np.diff(np.sort(train_frame_times))))
-    else:
-        dynamic_time_step = 3 / max(B - 1, 1)
-    scale_time_dynamic = np.repeat(dynamic_time_step / 10, xyz_dynamic.shape[0])
+    (
+        time_stamp_static,
+        scale_time_static,
+        time_stamp_dynamic_out,
+        scale_time_dynamic,
+        dynamic_time_step,
+    ) = initialize_temporal_attributes(
+        xyz_static,
+        xyz_dynamic,
+        time_stamp_dynamic,
+        train_frame_times,
+        B,
+        temporal_init_mode,
+    )
 
     xyz_sampled = np.concatenate([xyz_static, xyz_dynamic], axis=0)
     rgb_sampled = np.concatenate([rgb_static, rgb_dynamic], axis=0)
     prob_motion_sampled = np.concatenate([prob_motion_static.squeeze(), prob_motion_dynamic.squeeze()], axis=0)
-    time_stamp_sampled =  np.concatenate([time_stamp_static.squeeze(),  time_stamp_dynamic.squeeze()], axis=0)
+    time_stamp_sampled =  np.concatenate([time_stamp_static.squeeze(),  time_stamp_dynamic_out.squeeze()], axis=0)
     scale_time_sampled = np.concatenate([scale_time_static, scale_time_dynamic], axis=0)
     # xyz_sampled = xyz_static
     # rgb_sampled = rgb_static
@@ -368,6 +402,8 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
     print(f"time_stamp: {time_stamp_sampled.shape}")
     print(f"prob_motion: {prob_motion_sampled.shape}")
     print(f"scale_time: {scale_time_sampled.shape}")
+    print(f"temporal_init_mode: {temporal_init_mode}")
+    print(f"dynamic_time_step: {dynamic_time_step}")
     np.savez(f"{save_dir}/filtered_cvd.npz", 
             xyz=xyz_sampled,
             rgb=rgb_sampled,
@@ -383,6 +419,8 @@ def voxel_filter(droid_path, motion_path, save_dir, scene, use_mask=False,
         "num_train_frames": B,
         "num_pointcloud_frames": int(depth.shape[0]),
         "prune_stride": prune_stride,
+        "temporal_init_mode": temporal_init_mode,
+        "dynamic_time_step": dynamic_time_step,
         "train_frame_names": train_frame_names,
         "heldout_frame_names": test_frame_names,
     }
@@ -406,6 +444,10 @@ if __name__ == "__main__":
                         help="DyCheck/RoDyGS train-only split used to create the CVD input")
     parser.add_argument("--test_split_path", default=None,
                         help="DyCheck/RoDyGS held-out split recorded for evaluation")
+    parser.add_argument("--temporal_init_mode",
+                        choices=["motion_split", "all_static"],
+                        default="motion_split",
+                        help="Temporal t/scale_time init; spatial voxel split still uses motion_prob")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -414,4 +456,5 @@ if __name__ == "__main__":
                  prune_stride=args.prune_stride,
                  image_output_dir=args.image_output_dir,
                  train_split_path=args.train_split_path,
-                 test_split_path=args.test_split_path)
+                 test_split_path=args.test_split_path,
+                 temporal_init_mode=args.temporal_init_mode)

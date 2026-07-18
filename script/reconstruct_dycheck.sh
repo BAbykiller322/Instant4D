@@ -13,6 +13,7 @@ Options:
   --cache-root PATH        Intermediate cache root; default: $SCRATCH/instant4d_preprocess_cache.
   --gpu ID                 CUDA_VISIBLE_DEVICES value; default: 0.
   --stride N               Frame stride for mono depth, DroidSLAM, and flow; default: 1.
+  --temporal-init-mode M   Source temporal init: motion_split or all_static; default: motion_split.
   --keep-cache             Keep intermediate cache after final Instant4D source is written.
   --clean-cache            Remove this scene's cache before starting.
 EOF
@@ -25,6 +26,7 @@ GPU="0"
 STRIDE="1"
 KEEP_CACHE="0"
 CLEAN_CACHE="0"
+TEMPORAL_INIT_MODE="motion_split"
 CACHE_ROOT="${SCRATCH:-/tmp}/instant4d_preprocess_cache"
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --stride)
       STRIDE="$2"
+      shift 2
+      ;;
+    --temporal-init-mode)
+      TEMPORAL_INIT_MODE="$2"
       shift 2
       ;;
     --keep-cache)
@@ -187,6 +193,7 @@ python script/prune.py \
   --scene_name "$SCENE" \
   --image_output_dir "$MEGASAM_OUT/cvd_images" \
   --prune_stride 3 \
+  --temporal_init_mode "$TEMPORAL_INIT_MODE" \
   --train_split_path "$DYCHECK_TRAIN_SPLIT"
 
 cat > "$MEGASAM_OUT/manifest.json" <<EOF
@@ -201,6 +208,7 @@ cat > "$MEGASAM_OUT/manifest.json" <<EOF
   "instant4d_source": "$INSTANT4D_SOURCE",
   "cvd_npz": "$CVD_OUT_DIR/${SCENE}_sgd_cvd_hr.npz",
   "droid_npz": "$DROID_OUT_DIR/${SCENE}_droid.npz",
+  "temporal_init_mode": "$TEMPORAL_INIT_MODE",
   "stride": $STRIDE
 }
 EOF
